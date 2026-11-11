@@ -1,0 +1,846 @@
+/ =============================================================================
+// PROYECTO CDIO I — ROBOT ASPIRADORA AUTÓNOMA (ESP32)
+// Firmware de Producción — Control, Navegación, Succión y Diagnóstico
+// Autor: Santiago Peña Sánchez — Universidad del Quindío (Ingeniería Electrónica)
+// =============================================================================
+
+#include <Arduino.h>
+
+// -----------------------------------------------------------------------------
+// 1. DEFINICIONES DE TIPOS Y ENUMERACIONES (Al inicio para compatibilidad C++)
+// -----------------------------------------------------------------------------
+enum EstadoRobot {
+  ESTADO_REPOSO = 0,        // En espera, motores y succión apagados
+  ESTADO_LIMPIEZA = 1,      // Limpieza activa: navegación autónoma + succión
+  ESTADO_PAUSA = 2,         // Pausado por el usuario (actuadores detenidos)
+  ESTADO_EVASION = 3,       // Maniobra reactiva de escape tras obstáculo/choque
+  ESTADO_BATERIA_BAJA = 4,  // Bloqueo de seguridad por batería crítica (<9.0V)
+  ESTADO_MODO_PRUEBA = 5,   // Secuencia de auto-diagnóstico de hardware
+  ESTADO_EMERGENCIA = 6     // Parada total por hardware/software
+};
+
+enum EventoBoton {
+  EV_NINGUNO = 0,
+  EV_CORTO = 1,             // Pulsación corta (< 2s) -> Iniciar / Pausar
+  EV_LARGO = 2              // Pulsación larga (> 2s) -> Modo Prueba
+};
+
+enum DireccionGiro {
+  GIRO_IZQUIERDA = 0,
+  GIRO_DERECHA = 1
+};
+
+// -----------------------------------------------------------------------------
+// 2. ASIGNACIÓN DE PINES (ESP32 DevKit V1 - Plan de Pines CDIO)
+// -----------------------------------------------------------------------------
+// Tracción Diferencial (Puente H L298N)
+const int PIN_MOTOR_IZQ_PWM  = 18; // ENA (LEDC Canal PWM)
+const int PIN_MOTOR_IZQ_IN1  = 16; // IN1 Dirección Motor Izq (RX2)
+const int PIN_MOTOR_IZQ_IN2  = 17; // IN2 Dirección Motor Izq (TX2)
+const int PIN_MOTOR_DER_PWM  = 4;  // ENB (LEDC Canal PWM)
+const int PIN_MOTOR_DER_IN3  = 19; // IN3 Dirección Motor Der (D19)
+const int PIN_MOTOR_DER_IN4  = 21; // IN4 Dirección Motor Der (D21)
+
+// Succión (Turbina Centrífuga Blower 5015 vía MOSFET de nivel lógico)
+const int PIN_SUCCION_PWM    = 25; // Gate MOSFET Succión (LEDC PWM)
+
+// Sensores de Percepción
+const int PIN_BUMPER         = 27; // Microswitch Bumper Frontal (INPUT_PULLUP)
+const int PIN_IR_PISO        = 35; // Sensor IR TCRT5000 Abismo/Piso (ADC1_CH7)
+const int PIN_BAT_ADC        = 34; // Divisor de Batería 3S (ADC1_CH6)
+
+// Sensores Ultrasónicos HC-SR04 (Multiplexados temporalmente)
+const int PIN_US1_TRIG       = 23; // HC-SR04 Frontal Izquierdo TRIG
+const int PIN_US1_ECHO       = 36; // HC-SR04 Frontal Izquierdo ECHO (VP)
+const int PIN_US2_TRIG       = 22; // HC-SR04 Frontal Derecho TRIG
+const int PIN_US2_ECHO       = 39; // HC-SR04 Frontal Derecho ECHO (VN)
+
+// Interfaz de Usuario y Seguridad
+const int PIN_BOTON_START    = 32; // Pulsador Multifunción (INPUT_PULLUP)
+const int PIN_PARO_EMERG     = 14; // Seta de Parada de Emergencia (INPUT_PULLUP)
+const int PIN_LED_ESTADO     = 13; // LED 1 Verde (Marcha/Pausa/Test)
+const int PIN_LED_ALERTA     = 33; // LED 2 Rojo (Aviso Batería/Error)
+const int PIN_BUZZER         = 26; // Zumbador Piezoeléctrico (LEDC Tono)
+
+// -----------------------------------------------------------------------------
+// 3. PARÁMETROS DE CONFIGURACIÓN Y CALIBRACIÓN
+// -----------------------------------------------------------------------------
+// Parámetros PWM (ESP32 Arduino Core 3.x)
+const uint32_t FREQ_PWM_MOTORES = 5000; // 5 kHz (inaudible, baja disipación)
+const uint8_t  RES_PWM_BITS     = 8;    // 8 bits (0 a 255)
+
+// Velocidades de Tracción (0 a 255)
+const int VEL_CRUCERO           = 175;  // Velocidad de avance nominal (~0.25 m/s)
+const int VEL_GIRO              = 160;  // Velocidad durante rotación sobre el eje
+const int VEL_RETROCESO         = 150;  // Velocidad de desenganche en reversa
+const int DUTY_SUCCION_NOMINAL  = 200;  // 78% de potencia para el Blower 5015
+
+// Rampa de Aceleración No Bloqueante
+const unsigned long DT_RAMPA    = 15;   // Actualizar cada 15 ms
+const int PASO_RAMPA            = 8;    // Rampa 0 a 255 en ~480 ms
+
+// Umbrales de Percepción
+const float DISTANCIA_FRENADO_CM = 15.0; // Distancia para iniciar evasión
+const float DISTANCIA_ALERTA_CM  = 28.0; // Distancia para iniciar corrección suave
+const int   UMBRAL_ABISMO_ADC    = 2240; // > 2240 cuentas = borde de mesa / abismo
+
+// Umbrales de Batería 3S Li-ion (Divisor 33k / 10k -> factor 4.30)
+// 12.6V = Llena | 9.9V = Aviso (2857 cuentas) | 9.0V = Corte crítico (2597 cuentas)
+const int BAT_AVISO_ENTRA        = 2857; // 9.9 V
+const int BAT_AVISO_SALE         = 2944; // 10.2 V (Histéresis)
+const int BAT_CORTE_ENTRA        = 2597; // 9.0 V
+const int BAT_CORTE_SALE         = 2742; // 9.5 V (Histéresis)
+
+// Tiempos de Maniobra de Evasión (ms)
+const unsigned long T_REVERSA_EVASION = 450; // Tiempo retroceso al chocar
+const unsigned long T_GIRO_MIN_MS     = 350; // Giro mínimo (~45°)
+const unsigned long T_GIRO_MAX_MS     = 700; // Giro máximo (~110°)
+
+// -----------------------------------------------------------------------------
+// 4. VARIABLES GLOBALES DEL SISTEMA
+// -----------------------------------------------------------------------------
+EstadoRobot estadoActual = ESTADO_REPOSO;
+
+// Variables de Tracción
+int dutyActualIzq = 0, dutyObjIzq = 0;
+int dutyActualDer = 0, dutyObjDer = 0;
+unsigned long tUltimaRampa = 0;
+
+// Variables de Maniobra de Evasión
+unsigned long tInicioEvasion = 0;
+unsigned long duracionGiroEvasion = 450;
+int subEstadoEvasion = 0; // 0=Retrocediendo, 1=Girando
+DireccionGiro sentidoGiroEvasion = GIRO_IZQUIERDA;
+
+// Bumper por Interrupción
+volatile bool flagBumperImpacto = false;
+volatile unsigned long tBumperUs = 0;
+
+// Parada de Emergencia por Interrupción
+volatile bool flagParoEmergencia = false;
+
+// Estado de Batería
+bool avisoBateriaActivo = false;
+bool corteBateriaActivo = false;
+float voltajeBateriaFiltrado = 12.0;
+
+// Distancias Ultrasónicas (cm, -1 si fuera de rango)
+float distUS1 = -1.0; // Izquierda
+float distUS2 = -1.0; // Derecha
+byte sensorUSActivo = 0; // Alterna 0 <-> 1 para evitar interferencia
+unsigned long tProximoDisparoUS = 0;
+
+// Zumbador No Bloqueante
+unsigned long tFinBuzzer = 0;
+
+// Modo Prueba Automático
+bool pruebaEnCurso = false;
+int pasoPrueba = 0;
+unsigned long tPasoPrueba = 0;
+
+// -----------------------------------------------------------------------------
+// 5. RUTINAS DE INTERRUPCIÓN (ISR)
+// -----------------------------------------------------------------------------
+void IRAM_ATTR isrBumper() {
+  flagBumperImpacto = true;
+  tBumperUs = micros();
+}
+
+void IRAM_ATTR isrParadaEmergencia() {
+  flagParoEmergencia = true;
+}
+
+// -----------------------------------------------------------------------------
+// 6. FUNCIONES DE RETROALIMENTACIÓN ACÚSTICA Y TELEMETRÍA
+// -----------------------------------------------------------------------------
+void iniciarBuzzer() {
+  ledcAttach(PIN_BUZZER, 2000, RES_PWM_BITS);
+}
+
+void beep(unsigned int frecuencia, unsigned long duracionMs) {
+  ledcWriteTone(PIN_BUZZER, frecuencia);
+  tFinBuzzer = millis() + duracionMs;
+}
+
+void actualizarBuzzer() {
+  if (tFinBuzzer > 0 && millis() >= tFinBuzzer) {
+    ledcWriteTone(PIN_BUZZER, 0);
+    tFinBuzzer = 0;
+  }
+}
+
+const char* nombreEstado(EstadoRobot e) {
+  switch (e) {
+    case ESTADO_REPOSO:        return "REPOSO";
+    case ESTADO_LIMPIEZA:      return "LIMPIEZA";
+    case ESTADO_PAUSA:         return "PAUSA";
+    case ESTADO_EVASION:       return "EVASION";
+    case ESTADO_BATERIA_BAJA:  return "BATERIA_BAJA";
+    case ESTADO_MODO_PRUEBA:   return "PRUEBA";
+    case ESTADO_EMERGENCIA:    return "EMERGENCIA";
+    default:                   return "DESCONOCIDO";
+  }
+}
+
+void logEvento(const char* evento, float valor) {
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(nombreEstado(estadoActual));
+  Serial.print(",");
+  Serial.print(evento);
+  Serial.print(",");
+  Serial.println(valor, 2);
+}
+
+void transicion(EstadoRobot nuevoEstado, const char* motivo) {
+  Serial.print(millis());
+  Serial.print(" ms | TRANSICIÓN: ");
+  Serial.print(nombreEstado(estadoActual));
+  Serial.print(" -> ");
+  Serial.print(nombreEstado(nuevoEstado));
+  Serial.print(" | Causa: ");
+  Serial.println(motivo);
+  logEvento(motivo, 0);
+  estadoActual = nuevoEstado;
+}
+
+// -----------------------------------------------------------------------------
+// 7. CONTROL DE ACTUADORES Y RAMPA
+// -----------------------------------------------------------------------------
+void setMotoresDirecto(int vIzq, int vDer) { // v: -255 a +255
+  // Motor Izquierdo
+  if (vIzq > 0) {
+    digitalWrite(PIN_MOTOR_IZQ_IN1, HIGH);
+    digitalWrite(PIN_MOTOR_IZQ_IN2, LOW);
+  } else if (vIzq < 0) {
+    digitalWrite(PIN_MOTOR_IZQ_IN1, LOW);
+    digitalWrite(PIN_MOTOR_IZQ_IN2, HIGH);
+  } else {
+    digitalWrite(PIN_MOTOR_IZQ_IN1, LOW);
+    digitalWrite(PIN_MOTOR_IZQ_IN2, LOW);
+  }
+  dutyObjIzq = constrain(abs(vIzq), 0, 255);
+
+  // Motor Derecho
+  if (vDer > 0) {
+    digitalWrite(PIN_MOTOR_DER_IN3, HIGH);
+    digitalWrite(PIN_MOTOR_DER_IN4, LOW);
+  } else if (vDer < 0) {
+    digitalWrite(PIN_MOTOR_DER_IN3, LOW);
+    digitalWrite(PIN_MOTOR_DER_IN4, HIGH);
+  } else {
+    digitalWrite(PIN_MOTOR_DER_IN3, LOW);
+    digitalWrite(PIN_MOTOR_DER_IN4, LOW);
+  }
+  dutyObjDer = constrain(abs(vDer), 0, 255);
+}
+
+void actualizarRampaMotores() {
+  if (millis() - tUltimaRampa >= DT_RAMPA) {
+    tUltimaRampa = millis();
+
+    // Rampa Izquierda
+    if (dutyActualIzq < dutyObjIzq) dutyActualIzq = min(dutyActualIzq + PASO_RAMPA, dutyObjIzq);
+    else if (dutyActualIzq > dutyObjIzq) dutyActualIzq = max(dutyActualIzq - PASO_RAMPA, dutyObjIzq);
+    ledcWrite(PIN_MOTOR_IZQ_PWM, dutyActualIzq);
+
+    // Rampa Derecha
+    if (dutyActualDer < dutyObjDer) dutyActualDer = min(dutyActualDer + PASO_RAMPA, dutyObjDer);
+    else if (dutyActualDer > dutyObjDer) dutyActualDer = max(dutyActualDer - PASO_RAMPA, dutyObjDer);
+    ledcWrite(PIN_MOTOR_DER_PWM, dutyActualDer);
+  }
+}
+
+void detenerActuadoresInmediato() {
+  dutyObjIzq = 0; dutyActualIzq = 0;
+  dutyObjDer = 0; dutyActualDer = 0;
+  ledcWrite(PIN_MOTOR_IZQ_PWM, 0);
+  ledcWrite(PIN_MOTOR_DER_PWM, 0);
+  ledcWrite(PIN_SUCCION_PWM, 0);
+  digitalWrite(PIN_MOTOR_IZQ_IN1, LOW);
+  digitalWrite(PIN_MOTOR_IZQ_IN2, LOW);
+  digitalWrite(PIN_MOTOR_DER_IN3, LOW);
+  digitalWrite(PIN_MOTOR_DER_IN4, LOW);
+}
+
+void setSuccion(int duty) {
+  ledcWrite(PIN_SUCCION_PWM, constrain(duty, 0, 255));
+}
+
+// -----------------------------------------------------------------------------
+// 8. ADQUISICIÓN Y FILTRADO DE SENSORES
+// -----------------------------------------------------------------------------
+void leerBateria() {
+  static unsigned long tUltimaLectura = 0;
+  if (millis() - tUltimaLectura >= 100) {
+    tUltimaLectura = millis();
+
+    // Promedio de 16 lecturas consecutivas para estabilidad
+    long sumaADC = 0;
+    for (int i = 0; i < 16; i++) {
+      sumaADC += analogRead(PIN_BAT_ADC);
+    }
+    int adcProm = sumaADC / 16;
+
+    // Conversión a voltios en batería: Vbat = (ADC * 3.3 / 4095) * (43k / 10k)
+    float vInstantaneo = (adcProm * 3.3 / 4095.0) * 4.30;
+    voltajeBateriaFiltrado = (voltajeBateriaFiltrado * 0.90) + (vInstantaneo * 0.10);
+
+    // Evaluación de histéresis de aviso
+    if (!avisoBateriaActivo && adcProm < BAT_AVISO_ENTRA) avisoBateriaActivo = true;
+    else if (avisoBateriaActivo && adcProm > BAT_AVISO_SALE) avisoBateriaActivo = false;
+
+    // Evaluación de histéresis de corte
+    if (!corteBateriaActivo && adcProm < BAT_CORTE_ENTRA) corteBateriaActivo = true;
+    else if (corteBateriaActivo && adcProm > BAT_CORTE_SALE) corteBateriaActivo = false;
+  }
+}
+
+bool verificarAbismoPiso() {
+  int adcIR = analogRead(PIN_IR_PISO);
+  return (adcIR > UMBRAL_ABISMO_ADC);
+}
+
+// Máquina de estados no bloqueante para ultrasonidos alternados
+struct SensorUS {
+  byte pinTrig;
+  byte pinEcho;
+  int estado;
+  unsigned long t0;
+};
+SensorUS usSensores[2] = {
+  { PIN_US1_TRIG, PIN_US1_ECHO, 0, 0 },
+  { PIN_US2_TRIG, PIN_US2_ECHO, 0, 0 }
+};
+
+void actualizarUltrasonicosNoBloqueante() {
+  const unsigned long TIMEOUT_ECHO_US = 25000; // ~4.3 m máx
+
+  if (millis() < tProximoDisparoUS) return;
+
+  SensorUS &s = usSensores[sensorUSActivo];
+
+  switch (s.estado) {
+    case 0:
+      digitalWrite(s.pinTrig, HIGH);
+      s.t0 = micros();
+      s.estado = 1;
+      break;
+
+    case 1:
+      if (micros() - s.t0 >= 10) {
+        digitalWrite(s.pinTrig, LOW);
+        s.t0 = micros();
+        s.estado = 2;
+      }
+      break;
+
+    case 2:
+      if (digitalRead(s.pinEcho) == HIGH) {
+        s.t0 = micros();
+        s.estado = 3;
+      } else if (micros() - s.t0 > TIMEOUT_ECHO_US) {
+        if (sensorUSActivo == 0) distUS1 = -1.0;
+        else distUS2 = -1.0;
+        s.estado = 0;
+        sensorUSActivo ^= 1;
+        tProximoDisparoUS = millis() + 35;
+      }
+      break;
+
+    case 3:
+      if (digitalRead(s.pinEcho) == LOW) {
+        unsigned long duracion = micros() - s.t0;
+        float d = duracion / 58.2;
+        if (sensorUSActivo == 0) distUS1 = d;
+        else distUS2 = d;
+        s.estado = 0;
+        sensorUSActivo ^= 1;
+        tProximoDisparoUS = millis() + 35;
+      } else if (micros() - s.t0 > TIMEOUT_ECHO_US) {
+        if (sensorUSActivo == 0) distUS1 = -1.0;
+        else distUS2 = -1.0;
+        s.estado = 0;
+        sensorUSActivo ^= 1;
+        tProximoDisparoUS = millis() + 35;
+      }
+      break;
+  }
+}
+
+// -------------------------------------------------------------
+// 9. LÓGICA DEL BOTÓN MULTIFUNCIÓN (Arranque, Pausa y Modo Test)
+// -------------------------------------------------------------
+int leerBotonMultifuncion() {
+  static bool presionado = false;
+  static bool largoDisparado = false;
+  static unsigned long tPresionado = 0;
+  static int estadoBotonEstable = HIGH;
+  static int ultimoLeido = HIGH;
+  static unsigned long tDebounce = 0;
+
+  int evento = EV_NINGUNO;
+  int lectura = digitalRead(PIN_BOTON_START);
+
+  if (lectura != ultimoLeido) {
+    tDebounce = millis();
+    ultimoLeido = lectura;
+  }
+  if ((millis() - tDebounce) > 35) {
+    if (lectura != estadoBotonEstable) {
+      estadoBotonEstable = lectura;
+
+      if (estadoBotonEstable == LOW && !presionado) {
+        presionado = true;
+        largoDisparado = false;
+        tPresionado = millis();
+      } else if (estadoBotonEstable == HIGH && presionado) {
+        presionado = false;
+        if (!largoDisparado) {
+          evento = EV_CORTO;
+        }
+      }
+    }
+  }
+
+  if (presionado && !largoDisparado && (millis() - tPresionado >= 2000)) {
+    largoDisparado = true;
+    evento = EV_LARGO;
+  }
+
+  return evento;
+}
+
+// -------------------------------------------------------------
+// 10. MÁQUINA DE ESTADOS Y COMPORTAMIENTO NAVEGACIONAL
+// -------------------------------------------------------------
+void iniciarEvasion(DireccionGiro dirGiro, const char* motivo) {
+  transicion(ESTADO_EVASION, motivo);
+  subEstadoEvasion = 0;
+  tInicioEvasion = millis();
+  sentidoGiroEvasion = dirGiro;
+  duracionGiroEvasion = random(T_GIRO_MIN_MS, T_GIRO_MAX_MS);
+
+  setMotoresDirecto(-VEL_RETROCESO, -VEL_RETROCESO);
+  beep(1200, 80);
+}
+
+void actualizarNavegacionAutonoma() {
+  // Prioridad 1: Abismo / Escalón detectado
+  if (verificarAbismoPiso()) {
+    iniciarEvasion(GIRO_IZQUIERDA, "ABISMO_DETECTADO");
+    return;
+  }
+
+  // Prioridad 2: Choque en Bumper frontal
+  if (flagBumperImpacto || digitalRead(PIN_BUMPER) == LOW) {
+    flagBumperImpacto = false;
+    DireccionGiro dir = (random(0, 2) == 0) ? GIRO_IZQUIERDA : GIRO_DERECHA;
+    iniciarEvasion(dir, "BUMPER_CHOQUE");
+    return;
+  }
+
+  // Prioridad 3: Proximidad por Ultrasonidos HC-SR04
+  bool obstaculoIzq = (distUS1 > 0.0 && distUS1 < DISTANCIA_FRENADO_CM);
+  bool obstaculoDer = (distUS2 > 0.0 && distUS2 < DISTANCIA_FRENADO_CM);
+
+  if (obstaculoIzq && obstaculoDer) {
+    iniciarEvasion(GIRO_IZQUIERDA, "OBSTACULO_FRONTAL");
+    return;
+  } else if (obstaculoIzq) {
+    // Obstáculo a la izquierda -> Girar hacia la derecha suavemente
+    setMotoresDirecto(VEL_CRUCERO, VEL_CRUCERO / 4);
+    return;
+  } else if (obstaculoDer) {
+    // Obstáculo a la derecha -> Girar hacia la izquierda suavemente
+    setMotoresDirecto(VEL_CRUCERO / 4, VEL_CRUCERO);
+    return;
+  }
+
+  // Camino libre -> Avance crucero
+  setMotoresDirecto(VEL_CRUCERO, VEL_CRUCERO);
+}
+
+void actualizarEvasion() {
+  unsigned long tTranscurrido = millis() - tInicioEvasion;
+
+  if (subEstadoEvasion == 0) {
+    // Fase 1: Retroceso
+    if (tTranscurrido >= T_REVERSA_EVASION) {
+      subEstadoEvasion = 1;
+      tInicioEvasion = millis();
+      if (sentidoGiroEvasion == GIRO_IZQUIERDA) {
+        setMotoresDirecto(-VEL_GIRO, VEL_GIRO);
+      } else {
+        setMotoresDirecto(VEL_GIRO, -VEL_GIRO);
+      }
+    }
+  } else if (subEstadoEvasion == 1) {
+    // Fase 2: Giro sobre su propio eje
+    if (tTranscurrido >= duracionGiroEvasion) {
+      transicion(ESTADO_LIMPIEZA, "EVASION_COMPLETADA");
+      setSuccion(DUTY_SUCCION_NOMINAL);
+    }
+  }
+}
+
+// -------------------------------------------------------------
+// 11. MODO DE PRUEBA SECUENCIAL DE DIAGNÓSTICO
+// -------------------------------------------------------------
+void iniciarModoPrueba() {
+  pruebaEnCurso = true;
+  pasoPrueba = 0;
+  tPasoPrueba = millis() - 1000;
+  detenerActuadoresInmediato();
+  transicion(ESTADO_MODO_PRUEBA, "INICIO_DIAGNOSTICO");
+  Serial.println("\n=== INICIO DE AUTO-DIAGNÓSTICO DEL SISTEMA ===");
+}
+
+void actualizarModoPrueba() {
+  if (!pruebaEnCurso) return;
+  if (millis() - tPasoPrueba < 1000) return;
+  tPasoPrueba = millis();
+
+  detenerActuadoresInmediato();
+  beep(1400 + (pasoPrueba * 150), 100);
+
+  switch (pasoPrueba) {
+    case 0:
+      Serial.print("[Paso 0] Bumper frontal: ");
+      Serial.println(digitalRead(PIN_BUMPER) == LOW ? "CONTACTO DETECTADO [OK]" : "Libre [OK]");
+      break;
+    case 1:
+      Serial.print("[Paso 1] Sensor IR de piso: ADC = ");
+      Serial.print(analogRead(PIN_IR_PISO));
+      Serial.println(verificarAbismoPiso() ? " -> ABISMO" : " -> PISO NORMAL");
+      break;
+    case 2:
+      Serial.print("[Paso 2] Ultrasonido Izq: ");
+      Serial.print(distUS1, 1);
+      Serial.print(" cm | Der: ");
+      Serial.print(distUS2, 1);
+      Serial.println(" cm");
+      break;
+    case 3:
+      Serial.print("[Paso 3] Voltaje de Batería: ");
+      Serial.print(voltajeBateriaFiltrado, 2);
+      Serial.println(" V");
+      break;
+    case 4:
+      Serial.println("[Paso 4] Motor Izquierdo ADELANTE (1 s)");
+      setMotoresDirecto(170, 0);
+      break;
+    case 5:
+      Serial.println("[Paso 5] Motor Derecho ADELANTE (1 s)");
+      setMotoresDirecto(0, 170);
+      break;
+    case 6:
+      Serial.println("[Paso 6] Blower Succión ACTIVO (70%)");
+      setSuccion(180);
+      break;
+    case 7:
+      Serial.println("[Paso 7] Indicadores Visuales LED1 y LED2 ON");
+      digitalWrite(PIN_LED_ESTADO, HIGH);
+      digitalWrite(PIN_LED_ALERTA, HIGH);
+      break;
+    default:
+      Serial.println("=== DIAGNÓSTICO FINALIZADO CON ÉXITO ===\n");
+      pruebaEnCurso = false;
+      detenerActuadoresInmediato();
+      digitalWrite(PIN_LED_ESTADO, LOW);
+      digitalWrite(PIN_LED_ALERTA, LOW);
+      transicion(ESTADO_REPOSO, "FIN_DIAGNOSTICO");
+      beep(2000, 300);
+      return;
+  }
+  pasoPrueba++;
+}
+
+// -------------------------------------------------------------
+// 12. SEÑALIZACIÓN VISUAL Y SONORA
+// -------------------------------------------------------------
+void actualizarSenalizacionLEDs() {
+  if (estadoActual == ESTADO_MODO_PRUEBA) return;
+
+  unsigned long ahora = millis();
+  static unsigned long tBlinkLento = 0;
+  static unsigned long tBlinkRapido = 0;
+  static bool faseLenta = false;
+  static bool faseRapida = false;
+
+  if (ahora - tBlinkLento >= 500) {
+    tBlinkLento = ahora;
+    faseLenta = !faseLenta;
+  }
+  if (ahora - tBlinkRapido >= 100) {
+    tBlinkRapido = ahora;
+    faseRapida = !faseRapida;
+  }
+
+  switch (estadoActual) {
+    case ESTADO_REPOSO:
+      digitalWrite(PIN_LED_ESTADO, LOW);
+      digitalWrite(PIN_LED_ALERTA, avisoBateriaActivo ? HIGH : LOW);
+      break;
+
+    case ESTADO_LIMPIEZA:
+    case ESTADO_EVASION:
+      digitalWrite(PIN_LED_ESTADO, faseLenta ? HIGH : LOW);
+      digitalWrite(PIN_LED_ALERTA, avisoBateriaActivo ? HIGH : LOW);
+      break;
+
+    case ESTADO_PAUSA:
+      digitalWrite(PIN_LED_ESTADO, HIGH);
+      digitalWrite(PIN_LED_ALERTA, avisoBateriaActivo ? HIGH : LOW);
+      break;
+
+    case ESTADO_BATERIA_BAJA:
+      digitalWrite(PIN_LED_ESTADO, faseRapida ? HIGH : LOW);
+      digitalWrite(PIN_LED_ALERTA, faseRapida ? LOW : HIGH);
+      static unsigned long tBeepBat = 0;
+      if (ahora - tBeepBat >= 2000) {
+        tBeepBat = ahora;
+        beep(800, 150);
+      }
+      break;
+
+    case ESTADO_EMERGENCIA:
+      digitalWrite(PIN_LED_ESTADO, HIGH);
+      digitalWrite(PIN_LED_ALERTA, HIGH);
+      break;
+  }
+}
+
+// -------------------------------------------------------------
+// 13. MENÚ DE CONTROL Y TELEMETRÍA POR PUERTO SERIE
+// -------------------------------------------------------------
+void atenderComandosSerie() {
+  if (!Serial.available()) return;
+  char cmd = Serial.read();
+
+  switch (cmd) {
+    case 's':
+      Serial.println("\n--- ESTADO DE SENSORES ---");
+      Serial.print("Bumper: "); Serial.println(digitalRead(PIN_BUMPER) == LOW ? "CHOQUE" : "Libre");
+      Serial.print("Piso IR: ADC="); Serial.print(analogRead(PIN_IR_PISO));
+      Serial.println(verificarAbismoPiso() ? " [PELIGRO ABISMO]" : " [NORMAL]");
+      Serial.print("US1 (Izq): "); Serial.print(distUS1, 1); Serial.println(" cm");
+      Serial.print("US2 (Der): "); Serial.print(distUS2, 1); Serial.println(" cm");
+      Serial.print("Batería: "); Serial.print(voltajeBateriaFiltrado, 2); Serial.println(" V");
+      break;
+
+    case 'b':
+      Serial.print("Batería: "); Serial.print(voltajeBateriaFiltrado, 2); Serial.print(" V | ADC=");
+      Serial.print(analogRead(PIN_BAT_ADC));
+      Serial.print(" | Nivel estimado: ");
+      Serial.print(constrain((int)((voltajeBateriaFiltrado - 9.0) / (12.6 - 9.0) * 100), 0, 100));
+      Serial.println(" %");
+      break;
+
+    case 'e':
+      Serial.print("Estado Actual: ");
+      Serial.println(nombreEstado(estadoActual));
+      break;
+
+    case 'm':
+      Serial.println("Prueba de Tracción: Adelante 500 ms");
+      setMotoresDirecto(170, 170);
+      beep(1500, 80);
+      delay(500);
+      setMotoresDirecto(0, 0);
+      break;
+
+    case 'v':
+      Serial.println("Prueba de Succión: Blower 80% durante 1 s");
+      setSuccion(200);
+      beep(1800, 100);
+      delay(1000);
+      setSuccion(0);
+      break;
+
+    case 'p':
+      iniciarModoPrueba();
+      break;
+
+    case 'x':
+      detenerActuadoresInmediato();
+      transicion(ESTADO_EMERGENCIA, "COMANDO_SERIAL_X");
+      beep(400, 1500);
+      break;
+
+    case 'r':
+      if (estadoActual == ESTADO_EMERGENCIA || estadoActual == ESTADO_PAUSA) {
+        detenerActuadoresInmediato();
+        transicion(ESTADO_REPOSO, "RESET_SERIAL");
+        beep(1000, 100);
+      }
+      break;
+
+    case '?':
+    default:
+      Serial.println("\n=== MENÚ DE CONTROL Y DIAGNÓSTICO ===");
+      Serial.println(" 's' : Lectura en vivo de todos los sensores");
+      Serial.println(" 'b' : Diagnóstico de voltaje y nivel de batería");
+      Serial.println(" 'e' : Consultar estado actual de la máquina FSM");
+      Serial.println(" 'm' : Pulso de prueba de motores de tracción");
+      Serial.println(" 'v' : Pulso de prueba de turbina de succión");
+      Serial.println(" 'p' : Iniciar auto-diagnóstico paso a paso");
+      Serial.println(" 'x' : Parada de emergencia forzada");
+      Serial.println(" 'r' : Restablecer sistema a REPOSO");
+      break;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 14. INICIALIZACIÓN (SETUP)
+// -----------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  randomSeed(analogRead(35));
+
+  // Entradas Digitales con Pull-up
+  pinMode(PIN_BOTON_START, INPUT_PULLUP);
+  pinMode(PIN_PARO_EMERG, INPUT_PULLUP);
+  pinMode(PIN_BUMPER, INPUT_PULLUP);
+
+  // Salidas Digitales
+  pinMode(PIN_LED_ESTADO, OUTPUT);
+  pinMode(PIN_LED_ALERTA, OUTPUT);
+  pinMode(PIN_MOTOR_IZQ_IN1, OUTPUT);
+  pinMode(PIN_MOTOR_IZQ_IN2, OUTPUT);
+  pinMode(PIN_MOTOR_DER_IN3, OUTPUT);
+  pinMode(PIN_MOTOR_DER_IN4, OUTPUT);
+
+  // Ultrasonidos
+  pinMode(PIN_US1_TRIG, OUTPUT);
+  pinMode(PIN_US1_ECHO, INPUT);
+  pinMode(PIN_US2_TRIG, OUTPUT);
+  pinMode(PIN_US2_ECHO, INPUT);
+  digitalWrite(PIN_US1_TRIG, LOW);
+  digitalWrite(PIN_US2_TRIG, LOW);
+
+  // Canales PWM (LEDC ESP32 3.x)
+  ledcAttach(PIN_MOTOR_IZQ_PWM, FREQ_PWM_MOTORES, RES_PWM_BITS);
+  ledcAttach(PIN_MOTOR_DER_PWM, FREQ_PWM_MOTORES, RES_PWM_BITS);
+  ledcAttach(PIN_SUCCION_PWM, FREQ_PWM_MOTORES, RES_PWM_BITS);
+  iniciarBuzzer();
+
+  detenerActuadoresInmediato();
+
+  // Entradas Analógicas ADC1
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BAT_ADC, ADC_11db);
+  analogSetPinAttenuation(PIN_IR_PISO, ADC_11db);
+
+  // Interrupciones de Hardware Críticas
+  attachInterrupt(digitalPinToInterrupt(PIN_BUMPER), isrBumper, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_PARO_EMERG), isrParadaEmergencia, FALLING);
+
+  beep(1800, 200);
+  Serial.println("==========================================================");
+  Serial.println("  ROBOT ASPIRADORA AUTÓNOMA CDIO I — ESP32 DEVKIT V1      ");
+  Serial.println("  Sistema listo en modo REPOSO.                           ");
+  Serial.println("  - Pulsación corta en botón: Iniciar / Pausar            ");
+  Serial.println("  - Pulsación larga (>2s): Modo de Prueba Automático      ");
+  Serial.println("  - Escriba '?' en el monitor serie para ver comandos.    ");
+  Serial.println("==========================================================");
+  logEvento("SISTEMA_INICIADO", 0);
+}
+
+// -----------------------------------------------------------------------------
+// 15. BUCLE PRINCIPAL (LOOP 100% NO BLOQUEANTE)
+// -----------------------------------------------------------------------------
+void loop() {
+  // 1. Tareas de tiempo real continuas
+  actualizarBuzzer();
+  actualizarRampaMotores();
+  actualizarUltrasonicosNoBloqueante();
+  leerBateria();
+  atenderComandosSerie();
+
+  // 2. Seguridad: Parada de emergencia física
+  if (flagParoEmergencia || digitalRead(PIN_PARO_EMERG) == LOW) {
+    flagParoEmergencia = false;
+    detenerActuadoresInmediato();
+    transicion(ESTADO_EMERGENCIA, "PARO_EMERGENCIA_FISICO");
+    beep(400, 2000);
+  }
+
+  // 3. Seguridad: Corte por batería descargada
+  if (corteBateriaActivo && estadoActual != ESTADO_BATERIA_BAJA && estadoActual != ESTADO_EMERGENCIA) {
+    detenerActuadoresInmediato();
+    transicion(ESTADO_BATERIA_BAJA, "CORTE_BATERIA_CRITICA");
+  }
+
+  // 4. Lectura de pulsador de usuario
+  int evBoton = leerBotonMultifuncion();
+
+  // 5. Máquina de estados
+  switch (estadoActual) {
+    case ESTADO_REPOSO:
+      if (evBoton == EV_CORTO) {
+        transicion(ESTADO_LIMPIEZA, "BOTON_START");
+        setSuccion(DUTY_SUCCION_NOMINAL);
+        beep(1600, 100);
+      } else if (evBoton == EV_LARGO) {
+        iniciarModoPrueba();
+      }
+      break;
+
+    case ESTADO_LIMPIEZA:
+      if (evBoton == EV_CORTO) {
+        detenerActuadoresInmediato();
+        transicion(ESTADO_PAUSA, "BOTON_PAUSA");
+        beep(1000, 120);
+      } else {
+        actualizarNavegacionAutonoma();
+      }
+      break;
+
+    case ESTADO_EVASION:
+      if (evBoton == EV_CORTO) {
+        detenerActuadoresInmediato();
+        transicion(ESTADO_PAUSA, "BOTON_PAUSA");
+      } else {
+        actualizarEvasion();
+      }
+      break;
+
+    case ESTADO_PAUSA:
+      if (evBoton == EV_CORTO) {
+        transicion(ESTADO_LIMPIEZA, "BOTON_REANUDAR");
+        setSuccion(DUTY_SUCCION_NOMINAL);
+        beep(1600, 100);
+      } else if (evBoton == EV_LARGO) {
+        iniciarModoPrueba();
+      }
+      break;
+
+    case ESTADO_MODO_PRUEBA:
+      actualizarModoPrueba();
+      if (evBoton == EV_CORTO || evBoton == EV_LARGO) {
+        pruebaEnCurso = false;
+        detenerActuadoresInmediato();
+        transicion(ESTADO_REPOSO, "TEST_ABORTADO");
+      }
+      break;
+
+    case ESTADO_BATERIA_BAJA:
+      detenerActuadoresInmediato();
+      if (!corteBateriaActivo) {
+        transicion(ESTADO_REPOSO, "BATERIA_RECUPERADA");
+      }
+      break;
+
+    case ESTADO_EMERGENCIA:
+      detenerActuadoresInmediato();
+      if (evBoton == EV_LARGO) {
+        transicion(ESTADO_REPOSO, "RESET_EMERGENCIA");
+        beep(1200, 150);
+      }
+      break;
+  }
+
+  // 6. Indicadores luminosos
+  actualizarSenalizacionLEDs();
+}
